@@ -1,0 +1,87 @@
+#!/usr/bin/python
+
+from functools import partial
+
+from acme.jose import JWKRSA
+from botocore.credentials import SharedCredentialProvider
+
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import serialization
+
+from twisted.internet.defer import gatherResults
+from twisted.python.filepath import FilePath
+
+from txacme.challenges import LibcloudDNSResponder
+from txacme.client import Client
+from txacme.service import AcmeIssuingService
+from txacme.store import DirectoryStore
+from txacme.urls import LETSENCRYPT_DIRECTORY
+from txacme.util import generate_private_key
+
+import yaml
+
+cert_store = DirectoryStore(path=FilePath(__file__).sibling("certs"))
+
+config = yaml.safe_load(FilePath(__file__).sibling("config.yml").getContent())
+
+
+def get_aws_keys():
+    provider = SharedCredentialProvider("~/.aws/credentials")
+    credentials = provider.load()
+    return {
+        'username': credentials.access_key,
+        'password': credentials.secret_key,
+    }
+
+
+def get_key():
+    acme_key_file = FilePath(__file__).sibling(u'client.key')
+    if acme_key_file.exists():
+        key = serialization.load_pem_private_key(
+            acme_key_file.getContent(),
+            password=None,
+            backend=default_backend())
+    else:
+        key = generate_private_key(u'rsa')
+        acme_key_file.setContent(
+            key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=serialization.NoEncryption()))
+    return JWKRSA(key=key)
+
+
+def get_service(reactor):
+    responder = LibcloudDNSResponder.create(
+        reactor=reactor,
+        driver_name="route53",
+        zone_name=config['zone'],
+        **get_aws_keys()
+    )
+    service = AcmeIssuingService(
+        cert_store=cert_store,
+        responders=[responder],
+        clock=reactor,
+        client_creator=partial(
+            Client.from_url,
+            reactor=reactor, url=LETSENCRYPT_DIRECTORY, key=get_key())
+    )
+    service.startService()
+    reactor.addSystemEventTrigger('before', 'shutdown', service.stopService)
+    return service
+
+
+def main(reactor, *args):
+    service = get_service(reactor)
+    return gatherResults([
+        service.issue_cert(name.decode("utf8"))
+        for name in args
+    ])
+
+if __name__ == '__main__':
+    from sys import argv, stdout
+    from twisted.internet.task import react
+    from twisted.logger import globalLogBeginner, textFileLogObserver
+    globalLogBeginner.beginLoggingTo([textFileLogObserver(stdout)])
+
+    react(main, argv[1:])
